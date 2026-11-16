@@ -17,13 +17,12 @@ load_dotenv()
 app = FastAPI(
     title="Afrodelicious AI API",
     description="API for Brendy, SAM and Recipe Collector",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 security = HTTPBearer(auto_error=False)
 
 
-# Allow the local frontend and deployed Afrodelicious website
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -46,7 +45,6 @@ class AgentRequest(BaseModel):
 def verify_admin(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    # Require a Bearer access token
     if credentials is None:
         raise HTTPException(
             status_code=401,
@@ -73,7 +71,7 @@ def verify_admin(
     }
 
     try:
-        # Step 1: Verify the access token with Supabase Auth
+        # Verify the access token with Supabase Auth.
         auth_response = httpx.get(
             f"{base_url}/auth/v1/user",
             headers=headers,
@@ -101,8 +99,7 @@ def verify_admin(
                 detail="Invalid user session."
             )
 
-        # Step 2: Read the authenticated user's role.
-        # Supabase RLS allows users to read their own role.
+        # Verify that this user is an administrator.
         role_response = httpx.get(
             f"{base_url}/rest/v1/user_roles",
             headers=headers,
@@ -127,7 +124,13 @@ def verify_admin(
                 detail="Administrator access required."
             )
 
-        return user_id
+        # Keep the verified token for the configuration request.
+        return {
+            "user_id": user_id,
+            "access_token": credentials.credentials,
+            "supabase_url": base_url,
+            "supabase_key": supabase_key
+        }
 
     except HTTPException:
         raise
@@ -142,6 +145,61 @@ def verify_admin(
         raise HTTPException(
             status_code=503,
             detail="Unable to verify user permissions."
+        )
+
+
+def get_agent_config(agent_key, admin_context):
+
+    headers = {
+        "apikey": admin_context["supabase_key"],
+        "Authorization": f"Bearer {admin_context['access_token']}"
+    }
+
+    try:
+        response = httpx.get(
+            f"{admin_context['supabase_url']}/rest/v1/agent_configs",
+            headers=headers,
+            params={
+                "agent_key": f"eq.{agent_key}",
+                "select": "*"
+            },
+            timeout=15.0
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to load the saved agent configuration."
+            )
+
+        configs = response.json()
+
+        if not configs:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This agent has no saved configuration. "
+                    "Open the Admin AI Agents panel and save its configuration first."
+                )
+            )
+
+        config = configs[0]
+
+        if not config.get("enabled", True):
+            raise HTTPException(
+                status_code=403,
+                detail="This AI agent is currently disabled."
+            )
+
+        return config
+
+    except HTTPException:
+        raise
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to connect to the configuration service."
         )
 
 
@@ -163,13 +221,20 @@ def health():
 @app.post("/api/agent")
 def run_agent(
     request: AgentRequest,
-    admin_id: str = Depends(verify_admin)
+    admin_context: dict = Depends(verify_admin)
 ):
+    # Load the saved configuration for the requested agent.
+    agent_config = get_agent_config(
+        request.agent_type,
+        admin_context
+    )
+
     try:
         crew = create_crew(
             task_type=request.agent_type,
             user_request=request.user_request,
-            recipe_url=request.recipe_url
+            recipe_url=request.recipe_url,
+            agent_config=agent_config
         )
 
         result = crew.kickoff()
@@ -177,8 +242,12 @@ def run_agent(
         return {
             "success": True,
             "selected_agent": request.agent_type,
+            "agent_name": agent_config.get("display_name"),
             "result": str(result)
         }
+
+    except HTTPException:
+        raise
 
     except Exception:
         raise HTTPException(
