@@ -5,10 +5,37 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
 
+def find_recipe_data(data):
+    """Recursively search JSON-LD data for a Schema.org Recipe."""
+
+    if isinstance(data, list):
+        for item in data:
+            result = find_recipe_data(item)
+            if result:
+                return result
+
+    elif isinstance(data, dict):
+        item_type = data.get("@type", [])
+
+        if isinstance(item_type, str):
+            item_type = [item_type]
+
+        if any("Recipe" in str(t) for t in item_type):
+            return data
+
+        for value in data.values():
+            if isinstance(value, (dict, list)):
+                result = find_recipe_data(value)
+                if result:
+                    return result
+
+    return None
+
+
 def scrape_recipe_page(url: str) -> str:
     """
-    Fetch a public recipe webpage and extract its structured recipe data.
-    This function runs directly in Python, not through LLM tool calling.
+    Fetch a recipe webpage and extract Schema.org Recipe data.
+    Falls back to page text when structured recipe data is unavailable.
     """
 
     parsed_url = urlparse(url)
@@ -23,14 +50,24 @@ def scrape_recipe_page(url: str) -> str:
         })
 
     headers = {
-        "User-Agent": "Mozilla/5.0 AfrodeliciousRecipeCollector/1.0"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
     try:
         response = requests.get(
             url,
             headers=headers,
-            timeout=20
+            timeout=25,
+            allow_redirects=True
         )
         response.raise_for_status()
 
@@ -38,65 +75,39 @@ def scrape_recipe_page(url: str) -> str:
         return json.dumps({
             "success": False,
             "source_url": url,
-            "error": str(error)
+            "error": f"Could not fetch recipe webpage: {str(error)}"
         })
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    title = soup.title.get_text(strip=True) if soup.title else None
+    final_url = response.url
+    original_path = parsed_url.path.rstrip("/")
+    final_path = urlparse(final_url).path.rstrip("/")
 
-    description_tag = soup.find(
-        "meta",
-        attrs={"name": "description"}
-    )
-
-    description = (
-        description_tag.get("content")
-        if description_tag else None
-    )
+    # Detect redirects from a recipe URL to a homepage.
+    if original_path and final_path in ("", "/"):
+        return json.dumps({
+            "success": False,
+            "source_url": url,
+            "final_url": final_url,
+            "error": (
+                "The website redirected the recipe URL "
+                "to its homepage. Please try another recipe URL."
+            )
+        })
 
     recipe_data = None
 
-    # Find Schema.org Recipe data
+    # Search all JSON-LD scripts, including nested @graph objects.
     for script in soup.find_all(
         "script",
         type="application/ld+json"
     ):
         try:
-            data = json.loads(
-                script.string or script.get_text()
-            )
+            raw_data = script.string or script.get_text()
+            data = json.loads(raw_data)
 
-            items = data if isinstance(data, list) else [data]
-
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-
-                item_type = item.get("@type", [])
-
-                if isinstance(item_type, str):
-                    item_type = [item_type]
-
-                if "Recipe" in item_type:
-                    recipe_data = item
-                    break
-
-                for graph_item in item.get("@graph", []):
-                    if not isinstance(graph_item, dict):
-                        continue
-
-                    graph_type = graph_item.get("@type", [])
-
-                    if isinstance(graph_type, str):
-                        graph_type = [graph_type]
-
-                    if "Recipe" in graph_type:
-                        recipe_data = graph_item
-                        break
-
-                if recipe_data:
-                    break
+            recipe_data = find_recipe_data(data)
 
             if recipe_data:
                 break
@@ -105,11 +116,19 @@ def scrape_recipe_page(url: str) -> str:
             continue
 
     if recipe_data:
+        title = recipe_data.get("name")
+
+        if not title:
+            return json.dumps({
+                "success": False,
+                "source_url": url,
+                "error": "Recipe structured data has no title."
+            })
 
         result = {
             "success": True,
             "source_url": url,
-            "title": recipe_data.get("name"),
+            "title": title,
             "description": recipe_data.get("description"),
             "ingredients": recipe_data.get("recipeIngredient", []),
             "instructions": recipe_data.get("recipeInstructions", []),
@@ -121,22 +140,53 @@ def scrape_recipe_page(url: str) -> str:
         }
 
     else:
-        for element in soup(
-            ["script", "style", "nav", "footer", "header"]
-        ):
+        # Remove irrelevant webpage elements.
+        for element in soup([
+            "script", "style", "nav",
+            "footer", "header", "noscript"
+        ]):
             element.decompose()
+
+        # Prefer the actual page heading over the website title.
+        h1 = soup.find("h1")
+        title = h1.get_text(" ", strip=True) if h1 else None
+
+        description_tag = soup.find(
+            "meta",
+            attrs={"name": "description"}
+        )
+
+        description = (
+            description_tag.get("content")
+            if description_tag else None
+        )
+
+        page_text = soup.get_text(
+            separator=" ",
+            strip=True
+        )[:12000]
+
+        if not title:
+            return json.dumps({
+                "success": False,
+                "source_url": url,
+                "error": (
+                    "Could not identify a recipe title on this page. "
+                    "Please try another recipe URL."
+                )
+            })
 
         result = {
             "success": True,
             "source_url": url,
             "title": title,
             "description": description,
-            "page_text": soup.get_text(
-                separator=" ",
-                strip=True
-            )[:5000],
+            "page_text": page_text,
             "source": "Basic webpage extraction",
-            "note": "Structured recipe data was not found. Manual review required."
+            "note": (
+                "Structured recipe data was not found. "
+                "Manual review required."
+            )
         }
 
     return json.dumps(

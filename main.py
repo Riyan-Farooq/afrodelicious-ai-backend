@@ -217,7 +217,6 @@ def health():
         "status": "healthy"
     }
 
-
 @app.post("/api/agent")
 def run_agent(
     request: AgentRequest,
@@ -249,7 +248,15 @@ def run_agent(
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as error:
+        import traceback
+
+        print(
+            f"AI AGENT REQUEST FAILED: {repr(error)}",
+            flush=True
+        )
+        traceback.print_exc()
+
         raise HTTPException(
             status_code=500,
             detail="The AI agent could not complete the request."
